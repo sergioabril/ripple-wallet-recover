@@ -38,13 +38,21 @@ Instead of relying on single word inputs, It makes use of two text files, one fo
 
 		go get github.com/sergioabril/ripple-wallet-recover/wallet-recover
 
-5. Check the [documentation](http://godoc.org/bitbucket.org/dchapes/ripple)
-   to see what you can do with it.
-
 If the above `go get` fails, or you have dependency issues building/testing this,
 it is usually due to
 [incorrect `GOROOT` and/or `GOPATH` settings](http://golang.org/doc/code.html#GOPATH).
 If the build fails check that you have at least go1.2 (run `go version`).
+
+
+### How to use
+
+1. Go to `wallet-recover` folder, and replace `ripple-wallet.txt` with your old own wallet file.
+
+2. Open `names.txt` and put there every possible username you can remember, separated by one space.
+
+3. Open `words.txt` and put there as many passwords as possible, separated by one space.
+
+4. Open your Terminal, and go to the same folder. Once there, run `./wallet-recover` or `go run wallet-recover.go`, depending on the install method you've chosen.
 
 ---
 
