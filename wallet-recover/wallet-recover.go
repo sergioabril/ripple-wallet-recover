@@ -15,18 +15,20 @@ import (
 	"bytes"
 	"crypto/aes"
 	"crypto/cipher"
-	"crypto/rand"
+	//"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
 	"flag"
 	"fmt"
-	"io"
+	//"io"
 	"io/ioutil"
 	"log"
 	"net/url"
 	"os"
 	"strconv"
+	"bufio" //To scan words on a file
+	"strings"
 
 	"bitbucket.org/dchapes/ripple/crypto/ccm"
 	"golang.org/x/crypto/pbkdf2"
@@ -150,9 +152,9 @@ func (b base64data) xString() string {
 func main() {
 	walletFlag := flag.String("wallet", "ripple-wallet.txt", "input wallet filename, empty for stdin")
 	jsonFlag := flag.Bool("json", false, "dump the encrypted wallet JSON data")
-	nameFlag := flag.String("name", "", "wallet name (required)")
-	passFlag := flag.String("pass", "", "pass-phrase (required)")
-	stubFlag := flag.String("stub", "", "filename to write out a stubbed wallet")
+	nameFlag := flag.String("namelist", "names.txt", "specify wallet name list filename")
+	passFlag := flag.String("passlist", "words.txt", "specify password list filename")
+	//stubFlag := flag.String("stub", "", "filename to write out a stubbed wallet")
 	flag.Parse()
 
 	if flag.NArg() != 0 || *nameFlag == "" || *passFlag == "" {
@@ -160,191 +162,243 @@ func main() {
 		os.Exit(2) // match the exit code used by flag code should be EX_USAGE
 	}
 
-	// f is a io.Reader of the raw blob data
-	var f *os.File
-	var err error
-	if *walletFlag == "" {
-		f = os.Stdin
-		log.Println("Reading from stdin")
+
+
+	//READ NAMES FILE
+	var g *os.File
+	var errn error
+	var names []string
+	if *nameFlag == "" {
+		g = os.Stdin
+		log.Fatalf("You need to specify a file containing possible names")
 	} else {
-		f, err = os.Open(*walletFlag)
-		if err != nil {
-			log.Fatalf("Opening %q: %v", *walletFlag, err)
+		g, errn = os.Open(*nameFlag)
+		if errn != nil {
+			log.Fatalf("Opening %q: %v", *nameFlag, errn)
 		}
-		defer f.Close()
-		log.Printf("Opened file %q", *walletFlag)
-	}
-	// base64Decoder is an io.Reader of the base64 decoded blob
-	base64Decoder := base64.NewDecoder(base64.StdEncoding, f)
+		defer g.Close()
+		//log.Printf("Opened file %q", *walletFlag)
 
-	if *jsonFlag {
-		buf, err := ioutil.ReadAll(base64Decoder)
-		if err != nil {
-			log.Fatal("Reading:", err)
+		//Scan Words
+		scanner := bufio.NewScanner(g)
+		scanner.Split(bufio.ScanWords)
+
+		for scanner.Scan() {
+			names = append(names, scanner.Text())
 		}
-		log.Println("Decoded", len(buf), "bytes")
-		log.Printf("Raw data:\n%s", buf)
-		pp := new(bytes.Buffer)
-		err = json.Indent(pp, buf, "", "    ")
-		if err != nil {
-			log.Fatal("indent JSON failed:", err)
-		}
-		fmt.Println(pp)
-		// XXX already decoded but keeps the later code happy
-		base64Decoder = bytes.NewBuffer(buf)
+
+		//fmt.Println("Names list:")
+		//for _, word := range names {
+			//fmt.Println(word)
+		//}
 	}
 
-	jsonDecoder := json.NewDecoder(base64Decoder)
-	eBlob := new(encryptedBlob)
-	err = jsonDecoder.Decode(&eBlob)
-	if err != nil {
-		log.Fatal("JSON decoder:", err)
-	}
-
-	// now eBlob is a encryptedBlob struct with it's fields decoded
-	// and filled in.
-	// The eBlob.CT field is encrypted as specified by the Cipher,
-	// Mode, and other fields.
-
-	eBlob.IV.debug("IV")
-	eBlob.Salt.debug("salt")
-	log.Print("len(ciphertext):", len(eBlob.CT))
-	//eBlob.CT.debug("CT")
-	if n := len(eBlob.CT); n > 20 {
-		log.Printf("ciphertext %x…%x", eBlob.CT[:10], eBlob.CT[n-10:])
-	}
-
-	if true {
-		// This is the hash used for storage/lookup both in the
-		// local browser and at Payward.
-		blobHash := sha256.Sum256([]byte(*nameFlag + *passFlag))
-		log.Printf("blobHash: %x", blobHash)
-	}
-	passkey := strconv.Itoa(len(*nameFlag)) + "|" + *nameFlag + *passFlag
-	//passkey = *nameFlag + *passFlag // old bad method
-	log.Println("passkey:", passkey)
-	debug("passkey:", []byte(passkey))
-
-	key := pbkdf2.Key([]byte(passkey), eBlob.Salt, eBlob.Iter, eBlob.KS/8, sha256.New)
-	debug("key", key)
-
-	var cb cipher.Block
-	switch eBlob.Cipher {
-	case "aes":
-		cb, err = aes.NewCipher(key)
-		if err != nil {
-			log.Fatal("Error initializing AES:", err)
-		}
-	default:
-		log.Fatalf("Blob encrypted with unsupported cipher %q", eBlob.Cipher)
-	}
-	//log.Println("cipher:", cb)
-
-	var authmode cipher.AEAD
-	nonce := []byte(eBlob.IV)
-	switch eBlob.Mode {
-	case "ccm":
-		log.Println("tagsize:", eBlob.TS)
-		if eBlob.TS%8 != 0 {
-			log.Fatalf("bad tag size TS=%d, not a multiple of 8", eBlob.TS)
-		}
-		nlen := ccm.MaxNonceLength(len(eBlob.CT) - eBlob.TS/8)
-		log.Println("max nlen:", nlen)
-		if nlen > len(nonce) {
-			nlen = len(nonce)
-		} else {
-			nonce = nonce[:nlen]
-		}
-		log.Println("nlen:", nlen)
-		debug("nonce", nonce)
-		c, err := ccm.NewCCM(cb, eBlob.TS/8, nlen)
-		if err != nil {
-			log.Fatal("Error initializing CCM mode:", err)
-		}
-		log.Println("ccm MaxLength:", c.MaxLength())
-		authmode = c
-	case "cbc":
-		log.Println("WARNING: using CBC mode, data cannot be authenticated")
-		fallthrough // not supported
-	default:
-		log.Fatalf("Blob encrypted with unsupported cipher mode %q", eBlob.Mode)
-		//case "ocb2":
-	}
-	log.Println("authmode:", authmode)
-
-	debug("adata", []byte(eBlob.AData))
-	adata, _ := url.QueryUnescape(eBlob.AData) // XXX
-	debug("adata", []byte(adata))
-
-	blob, err := authmode.Open(nil, nonce, eBlob.CT, []byte(adata))
-	if err != nil {
-		log.Fatal("error decrypting and authenticating blob:", err)
-	}
-	log.Printf("blob: %q", blob)
-
-	if *jsonFlag {
-		pp := new(bytes.Buffer)
-		err = json.Indent(pp, blob, "", "    ")
-		if err != nil {
-			log.Fatal("indent JSON failed:", err)
-		}
-		fmt.Println(pp)
-	}
-
-	wallet := new(walletdata)
-	err = json.Unmarshal(blob, wallet)
-	if err != nil {
-		log.Fatal("JSON unmarshal failed:", err)
-	}
-
-	fmt.Printf("Wallet data: %v\n", *wallet)
-
-	// ****************
-	// experiment at re-encrypted a changed blob
-
-	wallet.MasterSeed = "sp6JS7f14BuwFY8Mw6bTtLKWauoUs" // The zero seed, should render the blob unusable?
-	newBlob, err := json.Marshal(wallet)
-	if err != nil {
-		log.Fatal("JSON marshal failed:", err)
-	}
-
-	newEncBlob := new(encryptedBlob)
-	*newEncBlob = *eBlob
-
-	newEncBlob.IV = make([]byte, 16)
-	_, err = rand.Read(newEncBlob.IV)
-	if err != nil {
-		log.Fatal("crypto/rand Read failed:", err)
-	}
-	newEncBlob.IV.debug("newIV")
-
-	newEncBlob.CT = authmode.Seal(nil, newEncBlob.IV[:13], newBlob, []byte(newEncBlob.AData))
-
-	//var outf *os.File
-	var outw io.Writer
-	if *stubFlag == "" {
-		//outw = os.Stdout
-		outw = ioutil.Discard
+	//READ PASSWORDS
+	var h *os.File
+	var errp error
+	var passwords []string
+	if *passFlag == "" {
+		h = os.Stdin
+		log.Fatalf("You need to specify a file containing possible names")
 	} else {
-		outf, err := os.Create(*stubFlag)
-		if err != nil {
-			log.Fatalf("Opening/creating %q: %v", *stubFlag, err)
+		h, errp = os.Open(*passFlag)
+		if errp != nil {
+			log.Fatalf("Opening %q: %v", *passFlag, errp)
 		}
-		defer outf.Close()
-		log.Printf("Opened and truncated file %q", *stubFlag)
-		outw = outf
-	}
-	base64Encoder := base64.NewEncoder(base64.StdEncoding, outw)
-	jsonEncoder := json.NewEncoder(base64Encoder)
-	err = jsonEncoder.Encode(newEncBlob)
-	if err != nil {
-		log.Fatal("JSON encoder:", err)
+		defer h.Close()
+		//log.Printf("Opened file %q", *walletFlag)
+
+		//Scan Words
+		scanner := bufio.NewScanner(h)
+		scanner.Split(bufio.ScanWords)
+
+		for scanner.Scan() {
+			passwords = append(passwords, scanner.Text())
+		}
+
+		//fmt.Println("Password list:")
+		//for _, word := range passwords {
+			//fmt.Println(word)
+		//}
 	}
 
-	//err = jsonEncoder.Close()
-	err = base64Encoder.Close()
-	if err != nil {
-		log.Fatal("close:", err)
+
+	//Two kind of possible key generation //0 old , 1 new
+	keymethods := []int{0, 1}
+
+
+
+	///
+	/// Here start the loop to bruteforce the wallet
+	///
+
+	for _, possiblename := range names {
+
+		for _, possiblepass := range passwords {
+
+			for _, usedkeymethod := range keymethods {
+
+				// READ WALLET FILE (ideally, it should be done only once, outside this loop)
+				// f is a io.Reader of the raw blob data
+				var f *os.File
+				var err error
+				if *walletFlag == "" {
+					f = os.Stdin
+					//log.Println("Reading from stdin")
+				} else {
+					f, err = os.Open(*walletFlag)
+					if err != nil {
+						log.Fatalf("Opening %q: %v", *walletFlag, err)
+					}
+					//defer f.Close() //no need to defer, it's called later
+					//log.Printf("Opened file %q", *walletFlag)
+				}
+				// base64Decoder is an io.Reader of the base64 decoded blob
+				base64Decoder := base64.NewDecoder(base64.StdEncoding, f)
+
+
+				//Work with wallet file
+				if *jsonFlag {
+					buf, err := ioutil.ReadAll(base64Decoder)
+					if err != nil {
+						log.Fatal("Reading:", err)
+					}
+					//log.Println("Decoded", len(buf), "bytes")
+					//log.Printf("Raw data:\n%s", buf)
+					pp := new(bytes.Buffer)
+					err = json.Indent(pp, buf, "", "    ")
+					if err != nil {
+						log.Fatal("indent JSON failed:", err)
+					}
+					//fmt.Println(pp)
+					// XXX already decoded but keeps the later code happy
+					base64Decoder = bytes.NewBuffer(buf)
+				}
+
+				jsonDecoder := json.NewDecoder(base64Decoder)
+				eBlobOG := new(encryptedBlob)
+				errorjson := jsonDecoder.Decode(&eBlobOG)
+				if errorjson != nil {
+					log.Fatal("JSON decoder Error:", errorjson)
+				}
+
+				//Close Wallet file, otherwise it would reach a limit of open files.
+				f.Close()
+
+				//Prepare new eBlob (I could use eBlobOG, but I was doing some tests)
+				//eBlob := new(encryptedBlob)
+				var eBlob = eBlobOG
+
+
+				//Prepare passwords
+				fixedname := strings.TrimSpace(possiblename)
+				fixedpass := strings.TrimSpace(possiblepass)
+
+				//Prepare key: What method?
+				passkey := ""
+				if usedkeymethod==0 {
+					//OLD
+					passkey = fixedname + fixedpass // old bad method
+				}else{
+					//NEW:
+					passkey = strconv.Itoa(len(fixedname)) + "|" + fixedname + fixedpass
+				}
+
+
+				//log.Println("passkey:",passkey)
+				//debug("passkey:", []byte(passkey))
+
+				key := pbkdf2.Key([]byte(passkey), eBlob.Salt, eBlob.Iter, eBlob.KS/8, sha256.New)
+				//debug("key", key)
+
+				var cb cipher.Block
+				switch eBlob.Cipher {
+				case "aes":
+					cb, err = aes.NewCipher(key)
+					if err != nil {
+						log.Fatal("Error initializing AES:", err)
+					}
+				default:
+					log.Fatalf("Blob encrypted with unsupported cipher %q", eBlob.Cipher)
+				}
+				//log.Println("cipher:", cb)
+
+				var authmode cipher.AEAD
+				nonce := []byte(eBlob.IV)
+				switch eBlob.Mode {
+				case "ccm":
+					//log.Println("tagsize:", eBlob.TS)
+					if eBlob.TS%8 != 0 {
+						log.Fatalf("bad tag size TS=%d, not a multiple of 8", eBlob.TS)
+					}
+					nlen := ccm.MaxNonceLength(len(eBlob.CT) - eBlob.TS/8)
+					//log.Println("max nlen:", nlen)
+					if nlen > len(nonce) {
+						nlen = len(nonce)
+					} else {
+						nonce = nonce[:nlen]
+					}
+					//log.Println("nlen:", nlen)
+					//debug("nonce", nonce)
+					c, err := ccm.NewCCM(cb, eBlob.TS/8, nlen)
+					if err != nil {
+						log.Fatal("Error initializing CCM mode:", err)
+					}
+					//log.Println("ccm MaxLength:", c.MaxLength())
+					authmode = c
+				case "cbc":
+					log.Println("WARNING: using CBC mode, data cannot be authenticated")
+					fallthrough // not supported
+				default:
+					log.Fatalf("Blob encrypted with unsupported cipher mode %q", eBlob.Mode)
+					//case "ocb2":
+				}
+				//log.Println("authmode:", authmode)
+
+				//debug("adata", []byte(eBlob.AData))
+				adata, _ := url.QueryUnescape(eBlob.AData) // XXX
+				//debug("adata", []byte(adata))
+
+				blob, errordecr := authmode.Open(nil, nonce, eBlob.CT, []byte(adata))
+				if errordecr != nil {
+					//IF IT FAILS, I JUST WANT TO CONTINUE WITH THE NEXT ONE, DOn'T EXIT
+					//log.Fatal("Error decrypting and authenticating blob:", err)
+					fmt.Print(".")
+					errordecr = nil
+					continue
+				}
+				//log.Printf("blob: %q", blob)
+
+				if *jsonFlag {
+					pp := new(bytes.Buffer)
+					err = json.Indent(pp, blob, "", "    ")
+					if err != nil {
+						log.Fatal("Password worked, but indent JSON failed:", err)
+					}
+					//fmt.Println(pp)
+				}
+
+				wallet := new(walletdata)
+				err = json.Unmarshal(blob, wallet)
+				if err != nil {
+					log.Fatal("Password worked, but JSON unmarshal failed:", err)
+				}
+				fmt.Printf("\n")
+				log.Printf("Success!")
+				log.Printf("Username: %q", possiblename)
+				log.Printf("Password: %q", possiblepass)
+				log.Printf("Seed: %q", wallet.MasterSeed)
+				log.Printf("Account id: %q", wallet.AccountID)
+
+				//Force exit so it ends here.
+				os.Exit(0)
+				//fmt.Printf("Wallet data: %v\n", *wallet)
+				//log.Println("EOF")
+			}
+		}
+
 	}
-	log.Println("EOF")
+
+	fmt.Printf("\nEnded without any match. Sorry.\n")
+
 }
